@@ -1,11 +1,63 @@
 import 'dotenv/config';
 import express from 'express';
-import { GoogleGenAI } from '@google/genai';
 
 const app = express();
 const port = process.env.PORT || 3000;
+const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
+const ollamaModel = process.env.OLLAMA_MODEL || 'llama3.1:8b';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+async function rewriteWithOllama(prompt) {
+  const response = await fetch(`${ollamaBaseUrl}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: ollamaModel,
+      prompt,
+      stream: false,
+    }),
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    const error = new Error(`Ollama request failed with status ${response.status}`);
+    error.status = response.status;
+    error.details = details;
+    throw error;
+  }
+
+  const data = await response.json();
+
+  if (!data.response || typeof data.response !== 'string') {
+    const error = new Error('Ollama returned an empty response.');
+    error.status = 502;
+    throw error;
+  }
+
+  return data.response.trim();
+}
+
+function formatOllamaError(err) {
+  const status = Number(err?.status || 500);
+
+  if (status === 404) {
+    return {
+      status: 502,
+      error: `Ollama model \"${ollamaModel}\" is not available locally. Run \"ollama pull ${ollamaModel}\" and try again.`,
+    };
+  }
+
+  if (err?.cause?.code === 'ECONNREFUSED' || /fetch failed/i.test(String(err?.message))) {
+    return {
+      status: 503,
+      error: 'Ollama is not reachable. Start Ollama and confirm it is listening on OLLAMA_BASE_URL.',
+    };
+  }
+
+  return {
+    status: 500,
+    error: 'Failed to rewrite text due to an Ollama error.',
+  };
+}
 
 app.use(express.json());
 app.use(express.static('public'));
@@ -33,18 +85,17 @@ Text:
 ${text}`;
 
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
-      contents: prompt,
-    });
-
-    res.json({ result: response.text });
+    const result = await rewriteWithOllama(prompt);
+    res.json({ result });
   } catch (err) {
-    console.error('Gemini error:', err);
-    res.status(500).json({ error: 'Failed to rewrite text. Check your API key and try again.' });
+    console.error('Ollama error:', err);
+    const clientError = formatOllamaError(err);
+    res.status(clientError.status).json({ error: clientError.error });
   }
 });
 
 app.listen(port, () => {
+  console.log(`Ollama base URL: ${ollamaBaseUrl}`);
+  console.log(`Ollama model: ${ollamaModel}`);
   console.log(`Text Rewriter running at http://localhost:${port}`);
 });
